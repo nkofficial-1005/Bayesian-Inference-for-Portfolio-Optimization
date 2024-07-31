@@ -1,0 +1,270 @@
+---
+title: "Stan R Code"
+author: "Nikita Kohli"
+date: "2022-12-05"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+#Set work directory
+setwd("D:/TRU/Bayesian and DL (DASC 6510)/Rstan")
+
+#Installation of RStan
+#install.packages("StanHeaders", repos = c("https://mc-stan.org/r-packages/", getOption("repos")))
+#install.packages("rstan", repos = c("https://mc-stan.org/r-packages/", getOption("repos")))
+
+#Loading libraries
+library(tidyr)
+library(dplyr)
+library(rstan)
+library(tibble)
+library(readr)
+library(quadprog)
+```
+
+```{r}
+#Demo: Simple iid Gaussian model
+# Simulating some data
+n = 100
+y = rnorm(n,1.6,0.2)
+
+# Running stan code
+model = stan_model("demo.stan")
+
+fit = sampling(model,
+               list(n=n,y=y),
+               iter=200,
+               chains=4,
+               algorithm = "HMC",
+               cores=4)
+
+print(fit)
+
+
+params = extract(fit)
+par(mfrow=c(1,2))
+ts.plot(params$mu,xlab="Iterations",ylab="mu", col = "red") #inc_warmup = TRUE includes the burn-in values
+hist(params$sigma,main="",xlab="sigma", col = "cyan")
+```
+
+```{r}
+#Portfolio Optimization
+#Original Time Series Data
+ex_rates <- read.csv('exchange_rates.csv', sep = ",", )
+head(ex_rates)
+
+#Visualizing the data set
+#Converting to plot the time series plot
+x = strptime(ex_rates$Date, '%Y-%m-%d')
+par(bg = '#EEEEEC')
+plot(x,
+     ex_rates$gbp_mxn,
+     col = 'green',
+     type = 'l',
+     lwd = 2.5,
+     ylab = 'Adj Price',
+     xlab = 'Date',
+     main = 'GBP')
+grid(col = 'black', lwd = 1.5)
+
+plot(x,
+     ex_rates$usd_mxn,
+     col = 'blue',
+     type = 'l',
+     lwd = 2.5,
+     ylab = 'Adj Price',
+     xlab = 'Date',
+     main = 'USD')
+grid(col = 'black', lwd = 1.5)
+
+plot(x,
+     ex_rates$eur_mxn,
+     col = 'red',
+     type = 'l',
+     lwd = 2.5,
+     ylab = 'Adj Price',
+     xlab = 'Date',
+     main = 'Euro')
+grid(col = 'black', lwd = 1.5)
+
+#Returns data (by taking log)
+ret <- read.csv('log_ret.csv')
+head(ret)
+
+#Mean of all the returns
+mean_ret <- apply(ret, 2, mean)
+
+#Covariance matrix
+cov_mat <- cov(ret)
+
+#Data for STAN
+T <- nrow(ret)
+N <- ncol(ret)
+nu <- 12
+tau <- 200 #considering this as 1/6th of T
+data_stan <- list(
+  T = T,
+  N = N,
+  nu = nu,
+  tau = 200,
+  eta = mean_ret,
+  R = as.matrix(ret),
+  omega = cov_mat * (nu - N -1)
+)
+
+#Fitting the model
+fit <- stan(
+  file = "bay_port.stan",
+  data = data_stan,
+  chains = 4,
+  warmup = 1000,
+  iter = 2000,
+  cores = 2
+)
+#Save the fitted model for future use because running takes a while
+saveRDS(fit, 'stan_fit.rds')
+
+fit <-readRDS('stan_fit.rds')
+
+#Some diagnostics for posterior predictive values
+plot(fit) 
+traceplot(fit, nrow = 4, pars = c('mu', 'sigma'))
+
+#Extract draws from the posterior
+list_of_draws <- extract(fit)
+
+#draws from the posterior distribution of sigma
+sigma_post <- list_of_draws$sigma
+sigma_post_new <- apply(sigma_post, c(2,3),mean)
+
+#draws from the posterior distribution of mu
+mu_post <- list_of_draws$mu
+mu_post_new <- apply(mu_post, c(2), mean)
+```
+
+
+```{r}
+#For mean of the returns
+#Prior distribution
+plot(density(mean_ret),
+      lwd = 2, col = "red",
+     main = "Empirical")
+
+#Posterior distribution
+plot(density(mu_post_new),
+lwd = 2, col = 'blue',
+main = "Posterior")
+```
+
+
+```{r}
+#For the variances of the returns
+#Prior distribution
+plot(density(cov_mat),
+      lwd = 2, col = "red",
+     main = "Empirical")
+#Posterior distribution
+plot(density(sigma_post_new),
+lwd = 2, col = 'blue',
+main = "Posterior")
+```
+
+```{r}
+M <- nrow(mu_post) #considering the whole data set
+
+#target (annual) return (varying this to find optimal value)
+annual_ret <- seq(0.02, 0.20, le = 100)
+
+#This tibble will store the optimal weights
+weights_opt <- tibble(eur = NULL,
+                      usd = NULL,
+                      gbp = NULL,
+                      target = NULL,
+                      sd = NULL)
+
+#Number of assets
+N <- ncol(mu_post)
+
+#Solves the optimization and averages the solutions
+#found for every target level
+for(i in 1:M){
+  #initialization
+  mu_tib <-  c()
+  var_opt <- c()
+
+  #draw from mu
+  mu_draw <- mu_post[i,]
+
+  #draw from sigma
+  sig_draw <- sigma_post[i, ,]
+
+  #Solves the optimization problem for each target value
+  for(j in annual_ret){
+
+    #Initial weights
+    w = 252
+    
+    A <- matrix(0, nrow = N,ncol = 2)
+    #sum of weights equals 1
+    A[,1] <- 1
+
+    #the target return constraint
+    A[,2] <- mu_draw * w
+
+    b0 <- c(1, j)
+    sol <- solve.QP(2 * w * sig_draw, #due to the objective function
+                    dvec = rep(0, N), #vector in the quadratic function
+                    Amat = A, #matrix for constraints
+                    bvec = b0, #default vector for zero in intercept
+                    meq = 2) #number of equality constraints
+    var_opt <- c(var_opt, sol$value )
+
+    #update weights_opt tibble
+    row <- c(sol$solution, j, sol$value)
+    weights_opt <- rbind(weights_opt, row)
+  }
+
+}
+names(weights_opt) <- c('eur',
+                        'usd',
+                        'gbp',
+                        'target',
+                        'std')
+
+write_csv(weights_opt, "opt_weights.csv")
+
+#tibble with the optimal weights
+weights_opt <- read.csv('opt_weights.csv')
+head(weights_opt)
+
+#Averages the values for each target value
+mean_opt_w <- weights_opt %>%
+  group_by(target) %>%
+  mutate(mean_eur = mean(eur),
+         mean_usd = mean(usd),
+         mean_gbp = mean(gbp),
+         mean_std = mean(std)) %>%
+  select(mean_eur,
+         mean_usd,
+         mean_gbp,
+         target,
+         mean_std) %>%
+  unique()
+
+par(bg = '#EEEEEC',
+    mfcol = c(1,1))
+
+#Plotting the percentage of the values
+plot(100 * mean_opt_w$mean_std, 
+     100 * mean_opt_w$target,
+     col = 'red', lwd = 2.5,
+     main = 'Average Efficient Frontier',
+     xlab = 'Standard Deviation %',
+     ylab = 'Expected return %',
+     type = 'l')
+grid(col = 'black', lwd = 1.5)
+```
